@@ -1,0 +1,195 @@
+#include <U8g2lib.h>
+#include <AiEsp32RotaryEncoder.h>
+#include <WiFi.h>
+#include <WiFiManager.h>
+#include <FirebaseESP32.h>
+#include <ArduinoJson.h>
+#include <Preferences.h>
+#include <time.h>
+
+// LED(+)-->5 , SDA-->21 , SCL-->22 , vcc-->Vin , clk-->18 , dt-->19 , sw-->23
+U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, /* reset=*/ U8X8_PIN_NONE);
+
+byte current_menu = 0; // 0=hours , 1=minutes , 2=seconds
+byte hours1 = 0; // First digit of hour
+byte hours2 = 0; // Second digit of hour
+byte minutes1 = 0; // First digit of minute
+byte minutes2 = 0; // Second digit of minute
+byte seconds1 = 0; // First digit of second
+byte seconds2 = 0; // Second digit of second
+
+byte first_digit = 0; // first digit in each selection
+byte second_digit = 0; // second digit in each selection
+byte current_pos = 0;
+
+bool text = true; // determine whether text showing
+
+// Conditions for menu in timer
+bool timer_menu = true; // true for timer false for menu
+bool pause_selected = false; // true if pause selected false play selected
+const int outline_y[] = {0, 22, 46}; // y position of outline
+
+// rotary encoder parameters
+#define clk 18
+#define dt 19
+#define sw 23
+
+// Led output
+#define p_out 5
+
+// Reset variables
+#define RESET_BUTTON_PIN 27
+
+//Plug ID
+#define plugID "plug002"
+
+// Firebase details
+#define FIREBASE_HOST "smarttimerplug-default-rtdb.firebaseio.com"
+#define FIREBASE_API_KEY "AIzaSyBv--LTAWwKUKwZeXPRXsJOiGF_22tDEIQ"
+
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+// Captive portal variables
+String firebaseEmail;
+String firebasePassword;
+String plugName;
+String userID;
+
+// Preferences
+Preferences preferences;
+
+// Connection variables
+bool wifiConnected = false;
+bool firebaseInitialized = false;
+
+static unsigned long lastWiFiCheck = 0;
+
+int CONNECTION_PIN = 26;
+
+// ESP32 mode
+bool onlineMode = false;
+
+// Other parameters (Original)
+int counter = 0;
+int lastEncoderValue;
+byte sw_state = 0;
+
+AiEsp32RotaryEncoder rotaryEncoder = AiEsp32RotaryEncoder(clk, dt, sw);
+
+void IRAM_ATTR readEncoderISR() {
+  rotaryEncoder.readEncoder_ISR();
+}
+
+unsigned long totalSeconds;
+
+// parameters for switch handling
+bool lastButtonState = false;
+unsigned long lastDebounceTime = 0;
+const unsigned long debounceDelay = 200;  // ms
+
+// Non-blocking text display timing
+unsigned long textStartTime = 0;
+const unsigned long textDisplayDuration = 1000; // 1 seconds
+
+void displayTimeDigits(byte h1, byte h2, byte m1, byte m2, byte s1, byte s2) {
+  char timeStr[9];
+  snprintf(timeStr, sizeof(timeStr), "%d%d:%d%d:%d%d", h1, h2, m1, m2, s1, s2);
+
+  u8g2.firstPage();
+  do {
+    u8g2.setFont(u8g2_font_fub20_tr);
+    int baselineY = 50;
+    int xStart = 10;
+
+    u8g2.drawStr(xStart, baselineY, timeStr);
+
+    // Get widths for precise rectangle positions
+    int digitWidth = u8g2.getStrWidth("0"); // width per digit approx
+    int colonWidth = u8g2.getStrWidth(":");
+
+    // Positions of each digit pair group
+    int posHours = xStart;
+    int posMinutes = posHours + 2 * digitWidth + colonWidth;
+    int posSeconds = posMinutes + 2 * digitWidth + colonWidth;
+
+    // Vertical rectangle parameters
+    int rectHeight = u8g2.getAscent() - u8g2.getDescent() + 6; // +6 for padding
+    int rectY = baselineY - u8g2.getAscent() - 3; // rectangle top slightly above baseline
+
+    // Draw outline around selected digit
+    int rectX = 0;
+    if (current_menu == 0) {
+      rectX = current_pos == 0 ? posHours : posHours + digitWidth - 1;
+    } else if (current_menu == 1) {
+      rectX = current_pos == 0 ? posMinutes - 4 : posMinutes + digitWidth - 4;
+    } else if (current_menu == 2) {
+      rectX = current_pos == 0 ? posSeconds - 9 : posSeconds + digitWidth - 9;
+    }
+    rectX -= 2;
+    u8g2.drawFrame(rectX, rectY, digitWidth + 2, rectHeight);
+  } while (u8g2.nextPage());
+}
+
+void drawSelectMode(byte selectedItem) {
+    const char* menuItems[2] = {"Run Online", "Run Offline"};
+
+    u8g2.firstPage();
+    do {
+        u8g2.setFont(u8g2_font_7x14_tr);
+        for (int i = 0; i < 2; i++) {
+            int yPos = 16 + i * 22;
+            int xPos = 23;
+
+            u8g2.drawStr(xPos, yPos, menuItems[i]);
+
+            if (i == selectedItem) {
+                int textWidth = u8g2.getStrWidth(menuItems[i]);
+                int rectX = xPos - 4;
+                int rectY = yPos - u8g2.getAscent();
+                int rectW = textWidth + 8;
+                int rectH = u8g2.getAscent() - u8g2.getDescent();
+
+                u8g2.drawFrame(rectX, rectY, rectW, rectH);
+            }
+        }
+    } while (u8g2.nextPage());
+}
+
+void setup() {
+    Serial.begin(115200);
+
+    pinMode(p_out, OUTPUT);
+    digitalWrite(p_out, LOW);
+    pinMode(CONNECTION_PIN, OUTPUT);
+    digitalWrite(CONNECTION_PIN, LOW);
+
+    pinMode(RESET_BUTTON_PIN, INPUT_PULLUP);
+
+    u8g2.setColorIndex(1);
+    u8g2.begin();
+    u8g2.setBitmapMode(1);
+
+    rotaryEncoder.begin();
+    rotaryEncoder.setup(readEncoderISR);
+    rotaryEncoder.setBoundaries(-1000, 1000, false);
+    rotaryEncoder.setAcceleration(0);
+
+    // Mode menu
+    current_menu = 7;
+    if (counter > 1) counter = 0;
+    else if (counter < 0) counter = 2;
+    if (sw_state == 1) {
+        switch (counter) {
+            case 0:
+                onlineMode = true;
+                break;
+            case 1:
+                onlineMode = false;
+                break;
+        }
+        sw_state = 0;
+    }
+    drawSelectMode(counter);
+}

@@ -1,0 +1,854 @@
+#include <U8g2lib.h>
+#include <AiEsp32RotaryEncoder.h>
+#include <WiFi.h>
+#include <WiFiManager.h>
+#include <FirebaseESP32.h>
+#include <ArduinoJson.h>
+#include <Preferences.h>
+#include <time.h>
+
+// LED(+)-->5 , SDA-->21 , SCL-->22 , vcc-->Vin , clk-->18 , dt-->19 , sw-->23
+U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, /* reset=*/ U8X8_PIN_NONE);
+
+byte current_menu = 0; // 0=hours , 1=minutes , 2=seconds
+byte hours1 = 0; // First digit of hour
+byte hours2 = 0; // Second digit of hour
+byte minutes1 = 0; // First digit of minute
+byte minutes2 = 0; // Second digit of minute
+byte seconds1 = 0; // First digit of second
+byte seconds2 = 0; // Second digit of second
+
+byte first_digit = 0; // first digit in each selection
+byte second_digit = 0; // second digit in each selection
+byte current_pos = 0;
+
+bool text = true; // determine whether text showing
+
+// Conditions for menu in timer
+bool timer_menu = true; // true for timer false for menu
+bool pause_selected = false; // true if pause selected false play selected
+const int outline_y[] = {0, 22, 46}; // y position of outline
+
+// rotary encoder parameters
+#define clk 18
+#define dt 19
+#define sw 23
+
+// Led output
+#define p_out 5
+
+// Firebase Variables
+#define RESET_BUTTON_PIN 27
+static bool resetTriggered = false;
+
+const int CONNECTION_PIN = 26;
+bool isDeleted = false;
+bool isPaused = false;
+bool isOn = true;
+int durationSeconds = 0;
+
+String firebaseEmail;
+String firebasePassword;
+String plugName;
+String userUID;
+
+String plugID = "plug001";
+
+Preferences preferences;
+
+#define FIREBASE_HOST "smarttimerplug-default-rtdb.firebaseio.com"
+#define FIREBASE_API_KEY "AIzaSyBv--LTAWwKUKwZeXPRXsJOiGF_22tDEIQ"
+
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+bool wifiConnected = false;
+bool firebaseInitialized = false;
+
+static unsigned long lastWiFiCheck = 0;
+
+// Firebase Read/Write Variables
+static unsigned long lastFirebaseUpdate = 0;
+static unsigned long lastFirebaseFetch = 0;
+static unsigned long lastSeenUpdate = 0;
+
+const unsigned long firebaseWriteInterval = 1000;
+const unsigned long firebaseReadInterval = 1000;
+const unsigned long lastSeenInterval = 2000;
+
+//
+
+unsigned long remoteDuration = 0;
+bool remoteIsOn = false;
+bool remoteIsPaused = false;
+bool fromApp = false;
+
+//
+int counter = 0;
+int lastEncoderValue;
+byte sw_state = 0;
+
+AiEsp32RotaryEncoder rotaryEncoder = AiEsp32RotaryEncoder(clk, dt, sw);
+
+void IRAM_ATTR readEncoderISR() {
+  rotaryEncoder.readEncoder_ISR();
+}
+
+unsigned long totalSeconds;
+
+// parameters for switch handling
+bool lastButtonState = false;
+unsigned long lastDebounceTime = 0;
+const unsigned long debounceDelay = 200;  // ms
+
+// Non-blocking text display timing
+unsigned long textStartTime = 0;
+const unsigned long textDisplayDuration = 1000; // 2 seconds
+
+void displayTimeDigits(byte h1, byte h2, byte m1, byte m2, byte s1, byte s2) {
+  char timeStr[9];
+  snprintf(timeStr, sizeof(timeStr), "%d%d:%d%d:%d%d", h1, h2, m1, m2, s1, s2);
+
+  u8g2.firstPage();
+  do {
+    u8g2.setFont(u8g2_font_fub20_tr);
+    int baselineY = 50;
+    int xStart = 10;
+
+    u8g2.drawStr(xStart, baselineY, timeStr);
+
+    // Get widths for precise rectangle positions
+    int digitWidth = u8g2.getStrWidth("0"); // width per digit approx
+    int colonWidth = u8g2.getStrWidth(":");
+
+    // Positions of each digit pair group
+    int posHours = xStart;
+    int posMinutes = posHours + 2 * digitWidth + colonWidth;
+    int posSeconds = posMinutes + 2 * digitWidth + colonWidth;
+
+    // Vertical rectangle parameters
+    int rectHeight = u8g2.getAscent() - u8g2.getDescent() + 6; // +6 for padding
+    int rectY = baselineY - u8g2.getAscent() - 3; // rectangle top slightly above baseline
+
+    // Draw outline around selected digit
+    int rectX = 0;
+    if (current_menu == 0) {
+      rectX = current_pos == 0 ? posHours : posHours + digitWidth - 1;
+    } else if (current_menu == 1) {
+      rectX = current_pos == 0 ? posMinutes - 4 : posMinutes + digitWidth - 4;
+    } else if (current_menu == 2) {
+      rectX = current_pos == 0 ? posSeconds - 9 : posSeconds + digitWidth - 9;
+    }
+    rectX -= 2;
+    u8g2.drawFrame(rectX, rectY, digitWidth + 2, rectHeight);
+  } while (u8g2.nextPage());
+}
+
+void displayTime(unsigned long t) {
+  int h = t / 3600;
+  int m = (t % 3600) / 60;
+  int s = t % 60;
+  char timeStr[9];
+  snprintf(timeStr, sizeof(timeStr), "%02d:%02d:%02d", h, m, s);
+
+  u8g2.firstPage();
+  do {
+    u8g2.setFont(u8g2_font_fub20_tr);
+    u8g2.drawStr(10, 50, timeStr);
+  } while (u8g2.nextPage());
+}
+
+void displayMenuText(const char* mainText, const char* subText) {
+  u8g2.firstPage();
+  do {
+    u8g2.setFont(u8g2_font_fub20_tr);
+
+    int mainTextWidth = u8g2.getStrWidth(mainText);
+    int screenWidth = 128;
+    int mainX = (screenWidth - mainTextWidth) / 2;
+    u8g2.drawStr(mainX, 25, mainText);
+
+    int subTextWidth = u8g2.getStrWidth(subText);
+    int subX = (screenWidth - subTextWidth) / 2;
+    u8g2.drawStr(subX, 55, subText);
+  } while (u8g2.nextPage());
+}
+
+void displayPauseMenu(byte selectedItem) {
+  const char* menuItems[3] = {"Reset", "Return", pause_selected ? "Play" : "Pause"};
+  
+  u8g2.firstPage();
+  do {
+    u8g2.setFont(u8g2_font_7x14_tr);
+    for (int i = 0; i < 3; i++) {
+      int yPos = 16 + i * 22; // y positions with some padding
+      int xPos = 23;
+
+      u8g2.drawStr(xPos, yPos, menuItems[i]);
+
+      if (i == selectedItem) {
+        int textWidth = u8g2.getStrWidth(menuItems[i]);
+        int rectX = xPos - 4;  // padding left
+        int rectY = yPos - u8g2.getAscent(); // top of text line
+        int rectW = textWidth + 8;  // padding both sides
+        int rectH = u8g2.getAscent() - u8g2.getDescent(); // height of font
+        
+        u8g2.drawFrame(rectX, rectY, rectW, rectH);
+      }
+    }
+  } while (u8g2.nextPage());
+}
+
+void reset() {
+  current_menu = 0;
+  counter = 0;
+  current_pos = 0;
+  text = true;
+  pause_selected = false;
+  sw_state = 0;
+  hours1 = 0;
+  hours2 = 0;
+  minutes1 = 0;
+  minutes2 = 0;
+  seconds1 = 0;
+  seconds2 = 0;
+  totalSeconds = 0;
+  timer_menu = true;
+  digitalWrite(p_out, LOW);
+  textStartTime = 0;
+  String basePath = "/users/";  
+  basePath += userUID;
+  basePath += "/plugs/";
+  basePath += plugID;
+  String path = basePath; path += "/isOn";
+  Firebase.setBool(fbdo, path, false);
+  path = basePath; path += "/isPaused";
+  Firebase.setBool(fbdo, path, false);
+  path = basePath; path += "/lastUpdatedBy";
+  Firebase.setString(fbdo, path, "esp");
+}
+
+void loadSavedSettings() {
+  preferences.begin("myplug", false);
+  firebaseEmail = preferences.getString("email", "");
+  firebasePassword = preferences.getString("fpass", "");
+  plugName = preferences.getString("pname", "");
+  preferences.end();
+}
+
+void saveSettings() {
+  preferences.begin("myplug", false);
+  preferences.putString("email", firebaseEmail);
+  preferences.putString("fpass", firebasePassword);
+  preferences.putString("pname", plugName);
+  preferences.end();
+}
+
+void createInitialPlugEntry() {
+  String basePath = "/users/";
+  basePath += userUID;
+  Serial.println(userUID);
+  basePath += "/plugs/";
+  basePath += plugID;
+  Serial.println(plugID);
+  Serial.println(basePath);
+
+  String path;
+  path = basePath; path += "/isOn";
+  if (Firebase.setBool(fbdo, path, false)) {
+    Serial.println("Set isOn successful");
+  } else {
+    Serial.println("Set isOn failed");
+    Serial.println(fbdo.errorReason());
+  }
+  path = basePath; path += "/isPaused";
+  Firebase.setBool(fbdo, path, false);
+  path = basePath; path += "/isDeleted";
+  Firebase.setBool(fbdo, path, false);
+  path = basePath; path += "/timeRemaining";
+  Firebase.setInt(fbdo, path, 0);
+  path = basePath; path += "/durationSeconds";
+  Firebase.setInt(fbdo, path, 0);
+  path = basePath; path += "/lastSeen";
+  time_t now;
+  do {
+    now = time(nullptr);
+    delay(100);
+  } while (now < 100000);
+  Firebase.setInt(fbdo, path, now);
+  path = basePath; path += "/name";
+  Firebase.setString(fbdo, path, plugName);
+  path = basePath; path += "/lastUpdatedBy";
+  Firebase.setString(fbdo, path, "esp");
+  Serial.println("New plug entry created.");
+
+  preferences.putBool("isInitialized", true);
+}
+
+void startCaptivePortal() {
+  WiFiManager wm;
+
+  //Custom parameters
+  WiFiManagerParameter custom_email("email", "Firebase Email", "", 40);
+  WiFiManagerParameter custom_pass("pass", "Firebase Password", "", 40);
+  WiFiManagerParameter custom_name("name", "Plug Name", "", 20);
+
+  wm.addParameter(&custom_email);
+  wm.addParameter(&custom_pass);
+  wm.addParameter(&custom_name);
+  //wm.setConfigPortalBlocking(false);
+
+  wm.setTitle("Smart Plug Config");
+
+  if (!wm.autoConnect("SmartPlug_Config")) {
+    Serial.println("Failed to connect.");
+    delay(3000);
+    ESP.restart();
+  }
+
+  //Saving values
+  firebaseEmail = custom_email.getValue();
+  firebasePassword = custom_pass.getValue();
+  plugName = custom_name.getValue();
+
+  saveSettings();
+
+  Serial.println("WiFi connected.");
+  configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+  Serial.print("Email ");
+  Serial.println(firebaseEmail);
+  Serial.print("Plug Name: ");
+  Serial.println(plugName);
+}
+
+void initFirebase() {
+  config.database_url = FIREBASE_HOST;
+  config.api_key = FIREBASE_API_KEY;
+  auth.user.email = firebaseEmail;
+  auth.user.password = firebasePassword;
+
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+
+  unsigned long timeout = millis();
+  while (!auth.token.uid.length() && millis() - timeout < 10000) {
+    delay(100);
+  }
+
+  if (auth.token.uid.length()) {
+    userUID = auth.token.uid.c_str();
+    Serial.print("UID: ");
+    Serial.println(userUID);
+  } else {
+    Serial.println("Failed to get user UID.");
+  }
+}
+
+void applyFirebaseControl() {
+  if (!fromApp) return;
+  static bool checkedDelete = false;
+  if (!checkedDelete && isDeleted) {
+    checkedDelete = true;
+    Serial.println("Resetting WiFi and user data due to flag.");
+
+    preferences.begin("credentials", false);
+    preferences.clear();
+    preferences.end();
+
+    WiFi.disconnect(true, true);
+    WiFiManager wm;
+    wm.resetSettings();
+    delay(1000);
+
+    ESP.restart();
+  }
+  if (remoteIsOn && !remoteIsPaused && current_menu != 4) {
+    // Start timer with remoteDuration
+    totalSeconds = remoteDuration;
+    current_menu = 4;
+    digitalWrite(p_out, HIGH);
+    pause_selected = false;
+    Serial.println("Timer started via app.");
+  }
+
+  if (remoteIsPaused && current_menu == 4) {
+    pause_selected = true;
+    digitalWrite(p_out, LOW);
+    Serial.println("Timer paused via app.");
+  }
+
+  if (remoteIsOn && !remoteIsPaused && pause_selected) {
+    pause_selected = false;
+    digitalWrite(p_out, HIGH);
+    Serial.println("Resuming timer via app.");
+  }
+
+  if (!remoteIsOn && current_menu == 4) {
+    reset();
+    Serial.println("Timer reset via app.");
+  }
+}
+
+void fetchPlugStatus() {
+  String basePath = "/users";
+  basePath += "/";
+  basePath += userUID;
+  basePath += "/plugs/";
+  basePath += plugID;
+
+  String fullPath;
+
+  fullPath = basePath; fullPath += "/lastUpdatedBy";
+  if (Firebase.getString(fbdo, fullPath)) {
+    String updatedBy = fbdo.stringData();
+    Serial.print("Last updated by: ");
+    Serial.println(updatedBy);
+
+    if (updatedBy == "app") {
+      fromApp = true;
+
+      fullPath = basePath; fullPath += "/isOn";
+      if (Firebase.getBool(fbdo, fullPath)) {
+        remoteIsOn = fbdo.boolData();
+      }
+      fullPath = basePath; fullPath += "/isPaused";
+      if (Firebase.getBool(fbdo, fullPath)) {
+        remoteIsPaused = fbdo.boolData();
+      }
+      fullPath = basePath; fullPath += "/isDeleted";
+      if (Firebase.getBool(fbdo, fullPath)) {
+        isDeleted = fbdo.boolData();
+        if (isDeleted) {
+          Firebase.setBool(fbdo, fullPath, false);
+          applyFirebaseControl();
+        }
+      }
+      fullPath = basePath; fullPath += "/durationSeconds";
+      if (Firebase.getBool(fbdo, fullPath)) {
+        remoteDuration = fbdo.intData();
+      }
+      Serial.println("Data fetched from app."); 
+      //fullPath = basePath; fullPath += "/lastUpdatedBy";
+      //Firebase.setString(fbdo, fullPath, "esp");
+    } else {
+      fromApp = false;
+      Serial.println("Skipped fetching. Last updated by ESP.");
+    }
+  } else {
+    Serial.println("Failed to read lastUpdatedBy.");
+  }
+}
+
+void checkAndInitPlugEntry() {
+  String basePath = "/users";
+  basePath += "/";
+  basePath += userUID;
+  basePath += "/plugs/";
+  basePath += plugID;
+
+  String path = basePath; path += "/isDeleted";
+  if (!Firebase.getBool(fbdo, path)) {
+    Serial.println("Plug does not exist. Creating new entry.");
+    createInitialPlugEntry();
+    return;
+  } 
+  bool isDeletedFlag = fbdo.boolData();
+
+  if (isDeletedFlag) {
+    Serial.println("Plug has been deleted. Creating new entry.");
+    createInitialPlugEntry();
+  } else {
+    Serial.println("Plug exists, and is active.");
+  }
+}
+
+void updateLastSeen() {
+  String basePath = "/users";
+  basePath += "/";
+  basePath += userUID;
+  basePath += "/plugs/";
+  basePath += plugID;
+  String path = basePath; path += "/lastSeen";
+  time_t now;
+  do {
+    now = time(nullptr);
+    delay(100);
+  } while (now < 100000); // wait until time is valid
+
+  Firebase.setInt(fbdo, path, now);
+}
+
+
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(p_out, OUTPUT);
+  digitalWrite(p_out, LOW);
+  pinMode(CONNECTION_PIN, OUTPUT);
+  digitalWrite(CONNECTION_PIN, LOW);
+
+  pinMode(RESET_BUTTON_PIN, INPUT_PULLUP);
+
+  u8g2.setColorIndex(1);
+  u8g2.begin();
+  u8g2.setBitmapMode(1);
+
+  rotaryEncoder.begin();
+  rotaryEncoder.setup(readEncoderISR);
+  rotaryEncoder.setBoundaries(-1000, 1000, false); // No limits
+  rotaryEncoder.setAcceleration(0); // Disable acceleration
+
+  //WiFi Connection
+
+  loadSavedSettings();
+
+  bool wifiNeedsReset = digitalRead(RESET_BUTTON_PIN) == LOW;
+  Serial.print("SSID: ");
+  Serial.println(WiFi.SSID());
+
+  if (!WiFi.SSID() || wifiNeedsReset) {
+    WiFi.disconnect(true, true);
+    WiFiManager wm;
+    wm.resetSettings();
+    delay(1000);
+    Serial.println("WiFi credentials erased.");
+    startCaptivePortal();
+  } else {
+    WiFi.begin();
+    int timeout = 5000;
+    unsigned long startAttempt = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - startAttempt < timeout) {
+      delay(500);
+      Serial.print(".");
+    }
+  }
+  Serial.println("Setup complete. Starting timer...");
+
+}
+
+void loop() {
+  static bool triedFirebase = false;
+
+  static unsigned long lastEncoderCheck = 0;
+  static const unsigned long encoderDebounceDelay = 100;  // ms
+
+  int rawValue = rotaryEncoder.readEncoder();
+  int currentEncoderValue = rawValue / 4;
+
+  unsigned long currentMillis = millis();
+
+  //WiFiManager wm;
+  //wm.process();
+
+  if (digitalRead(RESET_BUTTON_PIN) == LOW && !resetTriggered) {
+    resetTriggered = true;
+    Serial.println("Reset button pressed. Clearing WiFi credentials.");
+    
+    preferences.clear();
+    WiFi.disconnect(true, true);
+    WiFiManager wm;
+    wm.resetSettings();
+    delay(1000);
+    ESP.restart();
+  }
+
+  if (millis() - lastWiFiCheck > 5000) {
+    lastWiFiCheck = millis();
+    bool hasCredentials = WiFi.SSID() != "";
+    if (WiFi.status() != WL_CONNECTED) {
+      if (wifiConnected) {
+        Serial.println("WiFi lost.");
+        digitalWrite(CONNECTION_PIN, LOW);
+        wifiConnected = false;
+      }
+      if (hasCredentials){
+        Serial.println("Attempting WiFi reconnect...");
+        WiFi.begin();
+      } else {
+        Serial.println("No credentials - skipping reconnect.");
+        startCaptivePortal();
+      }
+    } else {
+      if (!wifiConnected) {
+        wifiConnected = true;
+        Serial.println("WiFi reconnected.");
+        configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+      }
+    if (wifiConnected && !firebaseInitialized && !triedFirebase) {
+      triedFirebase = true;
+      initFirebase();
+      if (preferences.getBool("initialized", false)) {
+        createInitialPlugEntry();
+      }
+      if (Firebase.ready()) {
+        Serial.println("Firebase ready!");
+        firebaseInitialized = true;
+        digitalWrite(CONNECTION_PIN, HIGH);
+        checkAndInitPlugEntry();
+      } else {
+        Serial.println("Firebase failed to initialize.");
+        digitalWrite(CONNECTION_PIN, LOW);
+      }
+    }
+    }
+  }
+
+  if (firebaseInitialized) {
+    if (millis() - lastFirebaseFetch > firebaseReadInterval) {
+      fetchPlugStatus();
+      applyFirebaseControl();
+      Serial.println(totalSeconds);
+      lastFirebaseFetch = millis();
+    }
+    if (millis() - lastSeenUpdate > lastSeenInterval) {
+      updateLastSeen();
+      lastSeenUpdate = millis();
+    }
+  }
+
+  if (totalSeconds == 0 && !remoteIsOn) {
+    current_menu = 0;
+    text = true;
+  } else if (remoteIsOn) {
+    current_menu = 4; // Start directly
+  }
+
+  if (totalSeconds == 0 && current_menu != 4 && current_menu != 5) {
+    digitalWrite(p_out, LOW);
+  }
+
+  if (currentMillis - lastEncoderCheck >= encoderDebounceDelay) {
+    if (currentEncoderValue > lastEncoderValue) {
+      counter--;
+      lastEncoderValue = currentEncoderValue;
+    } else if (currentEncoderValue < lastEncoderValue) {
+      counter++;
+      lastEncoderValue = currentEncoderValue;
+    }
+    lastEncoderCheck = currentMillis;
+  }
+
+  bool currentButtonState = rotaryEncoder.isEncoderButtonDown();
+
+  if (currentButtonState && !lastButtonState && (currentMillis - lastDebounceTime > debounceDelay)) {
+    sw_state = 1;
+    lastDebounceTime = currentMillis;
+  } else {
+    sw_state = 0;
+  }
+
+  lastButtonState = currentButtonState;
+
+  // Handle the 2-second text display without blocking delay
+  if (text) {
+    if (textStartTime == 0) {
+      textStartTime = currentMillis;
+    } else if (currentMillis - textStartTime > textDisplayDuration) {
+      text = false;
+      textStartTime = 0;
+    }
+  }
+
+  // Menu states
+  if (current_menu == 0) { // Setting Hours
+    if (text) {
+      displayMenuText("Set", "Hours");
+    } else {
+      if (current_pos == 0) {
+        if (sw_state == 1) {
+          current_pos = 1;
+          hours1 = first_digit;
+          counter = 0;
+        }
+        if (counter > 2) counter = 0;
+        else if (counter < 0) counter = 2;
+        first_digit = counter;
+        second_digit = hours2;
+      } else {
+        if (sw_state == 1) {
+          current_menu = 1;
+          hours2 = second_digit;
+          counter = 0;
+          current_pos = 0;
+          text = true;
+        }
+        if (hours1 == 2) {
+          if (counter > 3) counter = 0;
+          else if (counter < 0) counter = 3;
+        } else {
+          if (counter > 9) counter = 0;
+          else if (counter < 0) counter = 9;
+        }
+        second_digit = counter;
+        first_digit = hours1;
+      }
+      displayTimeDigits(first_digit, second_digit, minutes1, minutes2, seconds1, seconds2);
+    }
+  }
+
+  else if (current_menu == 1) { // Setting Minutes
+    if (text) {
+      displayMenuText("Set", "Minutes");
+    } else {
+      if (current_pos == 0) {
+        if (sw_state == 1) {
+          current_pos = 1;
+          minutes1 = first_digit;
+          counter = 0;
+        }
+        if (counter > 5) counter = 0;
+        else if (counter < 0) counter = 5;
+        first_digit = counter;
+        second_digit = minutes2;
+      } else {
+        if (sw_state == 1) {
+          current_menu = 2;
+          minutes2 = second_digit;
+          counter = 0;
+          current_pos = 0;
+          text = true;
+        }
+        if (counter > 9) counter = 0;
+        else if (counter < 0) counter = 9;
+        second_digit = counter;
+        first_digit = minutes1;
+      }
+      displayTimeDigits(hours1, hours2, first_digit, second_digit, seconds1, seconds2);
+    }
+  }
+
+  else if (current_menu == 2) { // Setting Seconds
+    if (text) {
+      displayMenuText("Set", "Seconds");
+    } else {
+      if (current_pos == 0) {
+        if (sw_state == 1) {
+          current_pos = 1;
+          seconds1 = first_digit;
+          counter = 0;
+        }
+        if (counter > 5) counter = 0;
+        else if (counter < 0) counter = 5;
+        first_digit = counter;
+        second_digit = seconds2;
+      } else {
+        if (sw_state == 1) {
+          current_menu = 3;
+          seconds2 = second_digit;
+          counter = 0;
+          current_pos = 0;
+          text = true;
+
+          // Calculate total seconds
+          totalSeconds = (hours1 * 10 + hours2) * 3600UL + (minutes1 * 10 + minutes2) * 60UL + (seconds1 * 10 + seconds2);
+        }
+        if (counter > 9) counter = 0;
+        else if (counter < 0) counter = 9;
+        second_digit = counter;
+        first_digit = seconds1;
+      }
+      displayTimeDigits(hours1, hours2, minutes1, minutes2, first_digit, second_digit);
+    }
+  }
+
+  else if (current_menu == 3) { // Start timer menu
+    if (text) {
+      displayMenuText("Start", "Timer");
+    } else {
+      if (sw_state == 1 && totalSeconds > 0) {
+        current_menu = 4;
+        sw_state = 0;
+        String basePath = "/users/";  
+        basePath += userUID;
+        basePath += "/plugs/";
+        basePath += plugID;
+        String path = basePath; path += "/isOn";
+        Firebase.setBool(fbdo, path, true);
+        path = basePath; path += "/isPaused";
+        Firebase.setBool(fbdo, path, false);
+        path = basePath; path += "/durationSeconds";
+        Firebase.setInt(fbdo, path, totalSeconds);
+        path = basePath; path += "/lastUpdatedBy";
+        Firebase.setString(fbdo, path, "esp");
+        digitalWrite(p_out, HIGH); // Timer started
+      }
+    }
+  }
+
+  else if (current_menu == 4) { // Timer running
+    static unsigned long lastSecond = 0;
+    if (!pause_selected) {
+      if (lastSecond == 0) lastSecond = currentMillis;
+
+      if (currentMillis - lastSecond >= 1000) {
+        totalSeconds --;
+        lastSecond += 1000;
+
+        if (totalSeconds == 0) {
+          digitalWrite(p_out, LOW);
+          current_menu = 5; // Timer complete
+          pause_selected = false;
+          text = true;
+          textStartTime = currentMillis;
+          lastSecond = 0;
+          timer_menu = true;
+        }
+      }
+    }
+
+    if (timer_menu) {
+      displayTime(totalSeconds);
+      if (sw_state == 1) {
+        timer_menu = !timer_menu;
+        sw_state = 0;
+      }
+    } else {
+      // Pause menu navigation
+      if (counter > 2) counter = 0;
+      else if (counter < 0) counter = 2;
+
+      if (sw_state == 1) {
+        switch (counter) {
+          case 0: // Return to timer display
+            timer_menu = true;
+            break;
+          case 1: // Reset
+            reset();
+            break;
+          case 2: // Pause/Play toggle
+            pause_selected = !pause_selected;
+            String basePath = "/users/";  
+            basePath += userUID;
+            basePath += "/plugs/";
+            basePath += plugID;
+            String path = basePath; path += "/isPaused";
+            Firebase.setBool(fbdo, path, pause_selected);
+            path = basePath; path += "/lastUpdatedBy";
+            Firebase.setString(fbdo, path, "esp");
+            break;
+        }
+        sw_state = 0;
+      }
+      displayPauseMenu(counter);
+    }
+  }
+
+  else if (current_menu == 5) { // Timer complete screen
+    if (text) {
+      u8g2.firstPage();
+      do {
+        u8g2.setFont(u8g2_font_fub17_tr);
+        u8g2.drawStr(0, 25, "Countdown");
+        u8g2.drawStr(0, 55, "Complete");
+      } while (u8g2.nextPage());
+    }
+
+    if (sw_state == 1) {
+      reset();
+      sw_state = 0;
+    }
+  }
+}
+
