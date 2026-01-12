@@ -1,0 +1,260 @@
+import 'package:flutter/material.dart';
+import 'dart:async';
+import 'package:firebase_core/firebase_core.dart';
+import 'firebase_options.dart';
+import 'package:firebase_database/firebase_database.dart';
+
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
+  runApp(const TimerApp());
+}
+
+class TimerApp extends StatelessWidget {
+  const TimerApp({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: 'Smart Timer App',
+      theme: ThemeData(
+        colorScheme: ColorScheme.fromSeed(seedColor: Colors.deepPurple),
+        useMaterial3: true,
+      ),
+      home: const TimerHomePage(),
+    );
+  }
+}
+
+class TimerHomePage extends StatefulWidget {
+  const TimerHomePage({super.key});
+
+  @override
+  State<TimerHomePage> createState() => TimerHomePageState();
+}
+
+class TimerHomePageState extends State<TimerHomePage> {
+  final databaseRef = FirebaseDatabase.instance.ref('Timer_App');
+
+  int totalSeconds = 0;
+  int hours = 0;
+  int minutes = 0;
+  int seconds = 0;
+  Timer? countdownTimer;
+  String? statusMessage;
+  Timer? messageTimer;
+
+  FixedExtentScrollController hourController = FixedExtentScrollController();
+  FixedExtentScrollController minuteController = FixedExtentScrollController();
+  FixedExtentScrollController secondController = FixedExtentScrollController();
+
+  @override
+  void initState() {
+    super.initState();
+
+    databaseRef.onValue.listen((event) {
+      final data = event.snapshot.value;
+      if (data is Map) {
+        final String? status = data['status'];
+        final String? source = data['source'];
+        final int duration = data['duration'] ?? 0;
+
+        if (source != 'esp') return;
+
+        switch (status) {
+          case 'setTimer':
+            startCountdown(duration);
+            break;
+          case 'resume':
+            startCountdown(duration);
+            break;
+          case 'pause':
+            countdownTimer?.cancel();
+            flashStatusMessage('Timer Paused');
+            break;
+          case 'reset':
+            resetLocalTimer();
+            flashStatusMessage('Timer Reset');
+            break;
+        }
+      }
+    });
+  }
+
+  void flashStatusMessage(String msg) {
+    setState(() {
+      statusMessage = msg;
+    });
+    messageTimer?.cancel();
+    messageTimer = Timer(const Duration(seconds: 2), () {
+      setState(() {
+        statusMessage = null;
+      });
+    });
+  }
+
+  void startCountdown(int duration) {
+    setState(() {
+      totalSeconds = duration;
+    });
+    countdownTimer?.cancel();
+    countdownTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
+      if (totalSeconds > 0) {
+        setState(() {
+          totalSeconds--;
+        });
+      } else {
+        timer.cancel();
+        flashStatusMessage('Countdown Completed');
+      }
+    });
+  }
+
+  String formatTime(int seconds) {
+    int h = seconds ~/ 3600;
+    int m = (seconds % 3600) ~/ 60;
+    int s = seconds % 60;
+    return '${h.toString().padLeft(2, '0')}h ${m.toString().padLeft(2, '0')}m ${s.toString().padLeft(2, '0')}s';
+  }
+
+  Future<void> setTimer() async {
+    int h = hourController.selectedItem;
+    int m = minuteController.selectedItem;
+    int s = secondController.selectedItem;
+
+    if (h > 23 || m > 59 || s > 59) {
+      flashStatusMessage('Invalid time');
+      return;
+    }
+
+    int newTotalSeconds = h * 3600 + m * 60 + s;
+
+    await databaseRef.set({
+      'duration': newTotalSeconds,
+      'status': 'setTimer',
+      'source': 'app',
+    });
+
+    startCountdown(newTotalSeconds);
+  }
+
+  Future<void> resetTimer() async {
+    await databaseRef.set({'duration': 0, 'status': 'reset', 'source': 'app'});
+  }
+
+  Future<void> pauseTimer() async {
+    await databaseRef.set({
+      'duration': totalSeconds,
+      'status': 'pause',
+      'source': 'app',
+    });
+  }
+
+  Future<void> resumeTimer() async {
+    await databaseRef.set({
+      'duration': totalSeconds,
+      'status': 'resume',
+      'source': 'app',
+    });
+  }
+
+  void resetLocalTimer() {
+    countdownTimer?.cancel();
+    setState(() {
+      totalSeconds = 0;
+    });
+  }
+
+  Widget buildPicker(
+    String label,
+    FixedExtentScrollController controller,
+    int max,
+  ) {
+    return Expanded(
+      child: ListWheelScrollView.useDelegate(
+        controller: controller,
+        itemExtent: 60,
+        diameterRatio: 1.2,
+        physics: const FixedExtentScrollPhysics(),
+        perspective: 0.01,
+        overAndUnderCenterOpacity: 0.4,
+        childDelegate: ListWheelChildLoopingListDelegate(
+          children: List.generate(
+            max + 1,
+            (index) => Center(
+              child: Text(
+                index.toString().padLeft(2, '0'),
+                style: const TextStyle(
+                  fontSize: 30,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('Smart Plug Timer')),
+      body: Padding(
+        padding: const EdgeInsets.all(16.0),
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.start,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            const Text('Set Timer Duration:', style: TextStyle(fontSize: 18)),
+            const SizedBox(height: 16),
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+              children: [
+                buildPicker('Hours', hourController, 23),
+                buildPicker('Minutes', minuteController, 59),
+                buildPicker('Seconds', secondController, 59),
+              ],
+            ),
+            const SizedBox(height: 24),
+            ElevatedButton(onPressed: setTimer, child: const Text('Set Timer')),
+            ElevatedButton(
+              onPressed: pauseTimer,
+              child: const Text('Pause Timer'),
+            ),
+            ElevatedButton(
+              onPressed: resumeTimer,
+              child: const Text('Resume Timer'),
+            ),
+            ElevatedButton(
+              onPressed: resetTimer,
+              child: const Text('Reset Timer'),
+            ),
+            const SizedBox(height: 24),
+            Center(
+              child: Column(
+                children: [
+                  Text(
+                    formatTime(totalSeconds),
+                    style: const TextStyle(
+                      fontSize: 32,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                  if (statusMessage != null)
+                    Text(
+                      statusMessage!,
+                      style: const TextStyle(
+                        fontSize: 18,
+                        color: Colors.redAccent,
+                      ),
+                    ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
