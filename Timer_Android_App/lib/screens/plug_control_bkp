@@ -1,0 +1,363 @@
+import 'dart:async';
+
+import 'package:flutter/material.dart';
+import 'package:firebase_auth/firebase_auth.dart';
+import 'package:firebase_database/firebase_database.dart';
+
+class PlugControlScreen extends StatefulWidget {
+  final String plugId;
+  final Map plugData;
+
+  const PlugControlScreen({
+    super.key,
+    required this.plugId,
+    required this.plugData,
+  });
+
+  @override
+  State<PlugControlScreen> createState() => _PlugControlScreenState();
+}
+
+class _PlugControlScreenState extends State<PlugControlScreen> {
+  int hours = 0;
+  int minutes = 0;
+  int seconds = 0;
+
+  int timeLeft = 0;
+  bool isPaused = false;
+  bool isPlugOnline = false;
+
+  int durationSeconds = 0;
+
+  late final Timer _timer;
+
+  late FixedExtentScrollController hourController;
+  late FixedExtentScrollController minuteController;
+  late FixedExtentScrollController secondController;
+
+  bool get plugOnline => getStatus() != "Disconnected";
+
+  @override
+  void initState() {
+    super.initState();
+
+    hourController = FixedExtentScrollController(initialItem: hours);
+    minuteController = FixedExtentScrollController(initialItem: minutes);
+    secondController = FixedExtentScrollController(initialItem: seconds);
+
+    durationSeconds = widget.plugData['durationSeconds'] ?? 0;
+
+    // Fetch live updates from Firebase every second
+    _timer = Timer.periodic(Duration(seconds: 1), (_) async {
+      final uid = FirebaseAuth.instance.currentUser!.uid;
+      final ref = FirebaseDatabase.instance.ref(
+        "users/$uid/plugs/${widget.plugId}",
+      );
+
+      final snapshot = await ref.get();
+      if (!snapshot.exists) return;
+
+      final data = Map<String, dynamic>.from(snapshot.value as Map);
+
+      setState(() {
+        isPlugOnline = plugOnline;
+        durationSeconds = data['durationSeconds'] ?? durationSeconds;
+        isPaused = data['isPaused'] ?? false;
+        widget.plugData['lastSeen'] = data['lastSeen'];
+        widget.plugData['name'] = data['name'];
+      });
+    });
+  }
+
+  void updateFirebase(String key, dynamic value) {
+    final uid = FirebaseAuth.instance.currentUser!.uid;
+    FirebaseDatabase.instance
+        .ref("users/$uid/plugs/${widget.plugId}/$key")
+        .set(value);
+  }
+
+  void setTimer() {
+    final totalSeconds = hours * 3600 + minutes * 60 + seconds;
+    updateFirebase('durationSeconds', totalSeconds);
+    updateFirebase('timeRemaining', totalSeconds);
+    updateFirebase('isPaused', false);
+    updateFirebase('startTime', DateTime.now().millisecondsSinceEpoch / 1000);
+    updateFirebase('lastUpdatedBy', 'app');
+    setState(() {
+      timeLeft = totalSeconds;
+      durationSeconds = totalSeconds;
+      isPaused = false;
+    });
+  }
+
+  void setPreset(int seconds) {
+    final h = seconds ~/ 3600;
+    final m = (seconds % 3600) ~/ 60;
+    final s = seconds % 60;
+
+    setState(() {
+      hours = h;
+      minutes = m;
+      this.seconds = s;
+
+      if (hourController.hasClients) hourController.jumpToItem(h);
+      if (minuteController.hasClients) minuteController.jumpToItem(m);
+      if (secondController.hasClients) secondController.jumpToItem(s);
+    });
+  }
+
+  String formatTime(int s) {
+    final h = (s ~/ 3600).toString().padLeft(2, '0');
+    final m = ((s % 3600) ~/ 60).toString().padLeft(2, '0');
+    final sec = (s % 60).toString().padLeft(2, '0');
+    return "$h:$m:$sec";
+  }
+
+  String getStatus() {
+    final now = DateTime.now().millisecondsSinceEpoch / 1000;
+    final lastSeen = widget.plugData['lastSeen'] ?? now;
+    final diff = now - lastSeen;
+
+    if (diff > 30) return "Disconnected"; // Not seen in last 30 sec
+    if (timeLeft == 0) return "Idle";
+    if (isPaused) return "Paused";
+    return "Running";
+  }
+
+  void _showRenameDialog() {
+    final controller = TextEditingController();
+    showDialog(
+      context: context,
+      builder:
+          (_) => AlertDialog(
+            title: const Text("Rename Plug"),
+            content: TextField(
+              controller: controller,
+              decoration: const InputDecoration(hintText: "Enter new name"),
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(context),
+                child: const Text("Cancel"),
+              ),
+              ElevatedButton(
+                onPressed: () {
+                  final uid = FirebaseAuth.instance.currentUser!.uid;
+                  FirebaseDatabase.instance
+                      .ref("users/$uid/plugs/${widget.plugId}")
+                      .update({'name': controller.text});
+                  Navigator.pop(context);
+                  setState(() {
+                    widget.plugData['name'] = controller.text;
+                  });
+                },
+                child: const Text("Save"),
+              ),
+            ],
+          ),
+    );
+  }
+
+  void _deletePlug() async {
+    final shouldDelete = await showDialog<bool>(
+      context: context,
+      builder:
+          (context) => AlertDialog(
+            title: const Text('Delete Plug?'),
+            content: const Text(
+              'Are you sure you want to delete this plug?\n'
+              'It will enter setup mode if connected.',
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(context, false),
+                child: const Text('Cancel'),
+              ),
+              TextButton(
+                onPressed: () => Navigator.pop(context, true),
+                child: const Text('Delete'),
+              ),
+            ],
+          ),
+    );
+
+    if (shouldDelete == true) {
+      final uid = FirebaseAuth.instance.currentUser!.uid;
+      final plugRef = FirebaseDatabase.instance.ref(
+        "users/$uid/plugs/${widget.plugId}",
+      );
+      await plugRef.update({"isDeleted": true});
+      Navigator.pop(context);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: Text(widget.plugData['name'] ?? "Plug Control"),
+        actions: [
+          PopupMenuButton<String>(
+            onSelected: (value) {
+              if (value == 'rename') {
+                _showRenameDialog();
+              } else if (value == 'delete') {
+                _deletePlug();
+              }
+            },
+            itemBuilder:
+                (context) => [
+                  const PopupMenuItem(
+                    value: 'rename',
+                    child: Text('Rename Plug'),
+                  ),
+                  const PopupMenuItem(
+                    value: 'delete',
+                    child: Text('Remove Plug'),
+                  ),
+                ],
+          ),
+        ],
+      ),
+
+      body: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          children: [
+            // Wheel pickers
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+              children: [
+                timePickerColumn(
+                  "Hours",
+                  23,
+                  (v) => setState(() => hours = v),
+                  hourController,
+                ),
+                timePickerColumn(
+                  "Min",
+                  59,
+                  (v) => setState(() => minutes = v),
+                  minuteController,
+                ),
+                timePickerColumn(
+                  "Sec",
+                  59,
+                  (v) => setState(() => seconds = v),
+                  secondController,
+                ),
+              ],
+            ),
+            const SizedBox(height: 30),
+
+            // Preset buttons
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+              children: [
+                presetButton("15m", 15 * 60),
+                presetButton("30m", 30 * 60),
+                presetButton("1h", 60 * 60),
+              ],
+            ),
+
+            const SizedBox(height: 30),
+
+            // Control buttons
+            Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                ElevatedButton(
+                  onPressed: setTimer,
+                  child: const Text("Set Timer"),
+                ),
+                const SizedBox(height: 10),
+                ElevatedButton(
+                  onPressed: () {
+                    updateFirebase('isPaused', true);
+                    setState(() => isPaused = true);
+                  },
+                  child: const Text("Pause"),
+                ),
+                const SizedBox(height: 10),
+                ElevatedButton(
+                  onPressed: () {
+                    updateFirebase('isPaused', false);
+                    setState(() => isPaused = false);
+                  },
+                  child: const Text("Resume"),
+                ),
+                const SizedBox(height: 10),
+                ElevatedButton(
+                  onPressed: () {
+                    updateFirebase('durationSeconds', 0);
+                    updateFirebase('isPaused', false);
+                    setState(() {
+                      timeLeft = 0;
+                      isPaused = false;
+                    });
+                  },
+                  child: const Text("Reset"),
+                ),
+              ],
+            ),
+
+            const SizedBox(height: 30),
+
+            // Progress bar
+            Text("Time Remaining: ${formatTime(timeLeft)}"),
+            LinearProgressIndicator(
+              value: durationSeconds > 0 ? timeLeft / durationSeconds : 0,
+              minHeight: 12,
+            ),
+            Text("Status: ${getStatus()}"),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget timePickerColumn(
+    String label,
+    int max,
+    Function(int) onChanged,
+    FixedExtentScrollController controller,
+  ) {
+    return Column(
+      children: [
+        Text(label),
+        SizedBox(
+          height: 100,
+          width: 60,
+          child: ListWheelScrollView.useDelegate(
+            controller: controller,
+            itemExtent: 40,
+            onSelectedItemChanged: onChanged,
+            perspective: 0.005,
+            physics: const FixedExtentScrollPhysics(),
+            childDelegate: ListWheelChildBuilderDelegate(
+              childCount: max + 1,
+              builder:
+                  (context, index) => Center(child: Text(index.toString())),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget presetButton(String label, int seconds) {
+    return ElevatedButton(
+      onPressed: () => setPreset(seconds),
+      child: Text(label),
+    );
+  }
+
+  @override
+  void dispose() {
+    hourController.dispose();
+    minuteController.dispose();
+    secondController.dispose();
+    _timer.cancel();
+    super.dispose();
+  }
+}

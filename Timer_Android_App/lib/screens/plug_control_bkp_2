@@ -1,0 +1,502 @@
+import 'dart:async';
+import 'package:flutter/material.dart';
+import 'package:firebase_auth/firebase_auth.dart';
+import 'package:firebase_database/firebase_database.dart';
+
+class PlugControlScreen extends StatefulWidget {
+  final String plugId;
+  final Map plugData;
+
+  const PlugControlScreen({
+    super.key,
+    required this.plugId,
+    required this.plugData,
+  });
+
+  @override
+  State<PlugControlScreen> createState() => _PlugControlScreenState();
+}
+
+class _PlugControlScreenState extends State<PlugControlScreen> {
+  // --- UI Control State (for time pickers) ---
+  int hours = 0;
+  int minutes = 0;
+  int seconds = 0;
+
+  late FixedExtentScrollController hourController;
+  late FixedExtentScrollController minuteController;
+  late FixedExtentScrollController secondController;
+
+  // --- Live State from Firebase (and derived local state) ---
+  // _currentDurationSeconds will represent the *effective* total duration for the current run,
+  // which might be the original set duration, or the remaining time if paused/disconnected.
+  int _currentDurationSeconds = 0;
+  bool _isPaused = false;
+  bool _isOn = false; // True when a timer is set and not completed/reset
+  int? _startTimeEpochSeconds; // When the current running segment started
+  int? _lastSeenEpochSeconds; // Last time ESP reported in
+
+  String _plugName = "Loading...";
+
+  // --- Local Countdown Variables ---
+  int _calculatedTimeLeft = 0; // The active countdown value
+  StreamSubscription? _firebaseSubscription;
+  Timer? _localCountdownTimer;
+
+  // --- Getters for computed state ---
+  String get _currentPlugStatus {
+    final now = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+    final lastSeen = _lastSeenEpochSeconds ?? now;
+    final diff = now - lastSeen;
+
+    if (!_isOn) return "Off";
+    if (_isPaused) return "Paused";
+    if (_calculatedTimeLeft <= 0) return "Idle";
+    if (diff > 20) return "Disconnected"; // fallback only
+    return "Running";
+  }
+
+  @override
+  void initState() {
+    super.initState();
+
+    hourController = FixedExtentScrollController(initialItem: hours);
+    minuteController = FixedExtentScrollController(initialItem: minutes);
+    secondController = FixedExtentScrollController(initialItem: seconds);
+
+    // Initialize local state variables from initial plugData
+    _plugName = widget.plugData['name'] ?? "Plug Control";
+    _currentDurationSeconds = widget.plugData['durationSeconds'] ?? 0;
+    _isPaused = widget.plugData['isPaused'] ?? false;
+    _isOn = widget.plugData['isOn'] ?? false;
+    _startTimeEpochSeconds =
+        widget.plugData['startTime'] != null
+            ? (widget.plugData['startTime'] as num).toInt()
+            : null;
+    _lastSeenEpochSeconds =
+        widget.plugData['lastSeen'] != null
+            ? (widget.plugData['lastSeen'] as num).toInt()
+            : null;
+
+    // --- Firebase Live Listener Setup ---
+    final uid = FirebaseAuth.instance.currentUser!.uid;
+    final ref = FirebaseDatabase.instance.ref(
+      "users/$uid/plugs/${widget.plugId}",
+    );
+
+    _firebaseSubscription = ref.onValue.listen(
+      (event) {
+        if (event.snapshot.exists && event.snapshot.value != null) {
+          final data = Map<String, dynamic>.from(event.snapshot.value as Map);
+          _updateLocalStateFromFirebase(data);
+        }
+      },
+      onError: (error) {
+        print("Firebase stream error: $error");
+      },
+    );
+
+    _calculateAndStartCountdown();
+  }
+
+  // --- Updated Firebase updater ---
+  void updateFirebase(String key, dynamic value) {
+    final uid = FirebaseAuth.instance.currentUser!.uid;
+    FirebaseDatabase.instance.ref("users/$uid/plugs/${widget.plugId}").update({
+      key: value,
+      'lastUpdatedBy': 'app',
+      'seenByEsp': false,
+    });
+  }
+
+  // --- Updated Firebase listener ---
+  void _updateLocalStateFromFirebase(Map<String, dynamic> data) {
+    if (data['lastUpdatedBy'] == 'app') return;
+
+    setState(() {
+      final now = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+      final oldStatus = _currentPlugStatus;
+
+      _currentDurationSeconds =
+          data['durationSeconds'] ?? _currentDurationSeconds;
+      _isPaused = data['isPaused'] ?? _isPaused;
+      _isOn = data['isOn'] ?? _isOn;
+      _startTimeEpochSeconds =
+          data['startTime'] != null ? (data['startTime'] as num).toInt() : null;
+      _lastSeenEpochSeconds =
+          data['lastSeen'] != null ? (data['lastSeen'] as num).toInt() : null;
+      _plugName = data['name'] ?? _plugName;
+
+      final newStatus = _currentPlugStatus;
+
+      if (newStatus == "Disconnected") {
+        // Preserve remaining time
+        _currentDurationSeconds = _calculatedTimeLeft;
+        _startTimeEpochSeconds = null;
+
+        // Stop the countdown
+        _localCountdownTimer?.cancel();
+        _localCountdownTimer = null;
+      }
+
+      _calculateAndStartCountdown();
+    });
+  }
+
+  // --- Updated timer calculator ---
+  void _calculateAndStartCountdown() {
+    _localCountdownTimer?.cancel();
+    _localCountdownTimer = null;
+
+    if (!_isOn || _currentDurationSeconds <= 0) {
+      _calculatedTimeLeft = 0;
+      return;
+    }
+
+    if (_isPaused || _startTimeEpochSeconds == null) {
+      _calculatedTimeLeft = _currentDurationSeconds;
+      return;
+    }
+
+    final now = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+    final elapsed = now - _startTimeEpochSeconds!;
+    _calculatedTimeLeft = _currentDurationSeconds - elapsed;
+
+    if (_calculatedTimeLeft <= 0) {
+      _calculatedTimeLeft = 0;
+      updateFirebase('durationSeconds', 0);
+      updateFirebase('isPaused', false);
+      updateFirebase('isOn', false);
+      updateFirebase('startTime', null);
+      return;
+    }
+
+    // Start countdown
+    _localCountdownTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
+      setState(() {
+        _calculatedTimeLeft--;
+        if (_calculatedTimeLeft <= 0) {
+          _calculatedTimeLeft = 0;
+          _localCountdownTimer?.cancel();
+          _localCountdownTimer = null;
+          updateFirebase('durationSeconds', 0);
+          updateFirebase('isPaused', false);
+          updateFirebase('isOn', false);
+          updateFirebase('startTime', null);
+        }
+      });
+    });
+  }
+
+  // --- Updated setTimer ---
+  void setTimer() {
+    final totalSeconds = hours * 3600 + minutes * 60 + seconds;
+    if (totalSeconds <= 0) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Please set a duration greater than 0.')),
+      );
+      return;
+    }
+
+    final now = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+    final uid = FirebaseAuth.instance.currentUser!.uid;
+    final ref = FirebaseDatabase.instance.ref(
+      "users/$uid/plugs/${widget.plugId}",
+    );
+    ref.update({
+      'durationSeconds': totalSeconds,
+      'isPaused': false,
+      'isOn': true,
+      'startTime': now,
+      'lastUpdatedBy': 'app',
+      'seenByEsp': false,
+    });
+
+    setState(() {
+      _currentDurationSeconds = totalSeconds;
+      _isPaused = false;
+      _isOn = true;
+      _startTimeEpochSeconds = now;
+    });
+
+    _calculateAndStartCountdown();
+  }
+
+  void setPreset(int seconds) {
+    final h = seconds ~/ 3600;
+    final m = (seconds % 3600) ~/ 60;
+    final s = seconds % 60;
+
+    setState(() {
+      hours = h;
+      minutes = m;
+      this.seconds = s;
+
+      if (hourController.hasClients) hourController.jumpToItem(h);
+      if (minuteController.hasClients) minuteController.jumpToItem(m);
+      if (secondController.hasClients) secondController.jumpToItem(s);
+    });
+  }
+
+  String formatTime(int s) {
+    if (s < 0) s = 0;
+    final h = (s ~/ 3600).toString().padLeft(2, '0');
+    final m = ((s % 3600) ~/ 60).toString().padLeft(2, '0');
+    final sec = (s % 60).toString().padLeft(2, '0');
+    return "$h:$m:$sec";
+  }
+
+  void _showRenameDialog() {
+    final controller = TextEditingController(text: _plugName);
+    showDialog(
+      context: context,
+      builder:
+          (_) => AlertDialog(
+            title: const Text("Rename Plug"),
+            content: TextField(
+              controller: controller,
+              decoration: const InputDecoration(hintText: "Enter new name"),
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(context),
+                child: const Text("Cancel"),
+              ),
+              ElevatedButton(
+                onPressed: () {
+                  final uid = FirebaseAuth.instance.currentUser!.uid;
+                  FirebaseDatabase.instance
+                      .ref("users/$uid/plugs/${widget.plugId}")
+                      .update({'name': controller.text});
+                  Navigator.pop(context);
+                },
+                child: const Text("Save"),
+              ),
+            ],
+          ),
+    );
+  }
+
+  void _deletePlug() async {
+    final shouldDelete = await showDialog<bool>(
+      context: context,
+      builder:
+          (context) => AlertDialog(
+            title: const Text('Delete Plug?'),
+            content: const Text(
+              'Are you sure you want to delete this plug?\n'
+              'It will enter setup mode if connected.',
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(context, false),
+                child: const Text('Cancel'),
+              ),
+              TextButton(
+                onPressed: () => Navigator.pop(context, true),
+                child: const Text('Delete'),
+              ),
+            ],
+          ),
+    );
+
+    if (shouldDelete == true) {
+      final uid = FirebaseAuth.instance.currentUser!.uid;
+      final plugRef = FirebaseDatabase.instance.ref(
+        "users/$uid/plugs/${widget.plugId}",
+      );
+      await plugRef.update({"isDeleted": true});
+      Navigator.pop(context);
+    }
+  }
+
+  // --- Pause button logic (attach to UI with onPressed) ---
+  void pauseLogic() {
+    updateFirebase('durationSeconds', _calculatedTimeLeft);
+    updateFirebase('isPaused', true);
+    updateFirebase('isOn', true);
+    updateFirebase('startTime', null);
+  }
+
+  // --- Resume button logic (attach to UI with onPressed) ---
+  void resumeLogic() {
+    final now = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+    updateFirebase('isPaused', false);
+    updateFirebase('startTime', now);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: Text(_plugName),
+        actions: [
+          PopupMenuButton<String>(
+            onSelected: (value) {
+              if (value == 'rename') {
+                _showRenameDialog();
+              } else if (value == 'delete') {
+                _deletePlug();
+              }
+            },
+            itemBuilder:
+                (context) => [
+                  const PopupMenuItem(
+                    value: 'rename',
+                    child: Text('Rename Plug'),
+                  ),
+                  const PopupMenuItem(
+                    value: 'delete',
+                    child: Text('Remove Plug'),
+                  ),
+                ],
+          ),
+        ],
+      ),
+      body: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          children: [
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+              children: [
+                timePickerColumn(
+                  "Hours",
+                  23,
+                  (v) => setState(() => hours = v),
+                  hourController,
+                ),
+                timePickerColumn(
+                  "Min",
+                  59,
+                  (v) => setState(() => minutes = v),
+                  minuteController,
+                ),
+                timePickerColumn(
+                  "Sec",
+                  59,
+                  (v) => setState(() => seconds = v),
+                  secondController,
+                ),
+              ],
+            ),
+            const SizedBox(height: 30),
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+              children: [
+                presetButton("15m", 15 * 60),
+                presetButton("30m", 30 * 60),
+                presetButton("1h", 60 * 60),
+              ],
+            ),
+            const SizedBox(height: 30),
+            Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                ElevatedButton(
+                  onPressed: setTimer,
+                  child: const Text("Set Timer"),
+                ),
+                const SizedBox(height: 10),
+                ElevatedButton(
+                  onPressed: () {
+                    pauseLogic();
+                    updateFirebase('lastUpdatedBy', 'app');
+                    updateFirebase('seenByEsp', false);
+                  },
+
+                  // Only allow pausing if the timer is currently 'Running'
+                  // The button should be disabled otherwise.
+                  child: const Text("Pause"),
+                ),
+                const SizedBox(height: 10),
+                ElevatedButton(
+                  onPressed: () {
+                    resumeLogic();
+                    updateFirebase('lastUpdatedBy', 'app');
+                    updateFirebase('seenByEsp', false);
+                  },
+
+                  // Only allow resuming if the timer is currently 'Paused'
+                  child: const Text("Resume"),
+                ),
+                const SizedBox(height: 10),
+                ElevatedButton(
+                  onPressed: () {
+                    // Reset timer in Firebase: duration, pause, isOn, startTime all go to initial/off state
+                    updateFirebase('durationSeconds', 0);
+                    updateFirebase('isPaused', false);
+                    updateFirebase('isOn', false); // Explicitly turn off
+                    updateFirebase(
+                      'startTime',
+                      DateTime.now().millisecondsSinceEpoch ~/ 1000,
+                    );
+                    updateFirebase('lastUpdatedBy', 'app');
+                    updateFirebase('seenByEsp', false);
+                  },
+                  child: const Text("Reset"),
+                ),
+              ],
+            ),
+            const SizedBox(height: 30),
+            Text("Time Remaining: ${formatTime(_calculatedTimeLeft)}"),
+            LinearProgressIndicator(
+              value:
+                  _currentDurationSeconds > 0
+                      ? _calculatedTimeLeft / _currentDurationSeconds
+                      : 0,
+              minHeight: 12,
+            ),
+            Text("Status: ${_currentPlugStatus}"), // Display calculated status
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget timePickerColumn(
+    String label,
+    int max,
+    Function(int) onChanged,
+    FixedExtentScrollController controller,
+  ) {
+    return Column(
+      children: [
+        Text(label),
+        SizedBox(
+          height: 100,
+          width: 60,
+          child: ListWheelScrollView.useDelegate(
+            controller: controller,
+            itemExtent: 40,
+            onSelectedItemChanged: onChanged,
+            perspective: 0.005,
+            physics: const FixedExtentScrollPhysics(),
+            childDelegate: ListWheelChildBuilderDelegate(
+              childCount: max + 1,
+              builder:
+                  (context, index) => Center(child: Text(index.toString())),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget presetButton(String label, int seconds) {
+    return ElevatedButton(
+      onPressed: () => setPreset(seconds),
+      child: Text(label),
+    );
+  }
+
+  @override
+  void dispose() {
+    hourController.dispose();
+    minuteController.dispose();
+    secondController.dispose();
+    _firebaseSubscription?.cancel();
+    _localCountdownTimer?.cancel();
+    super.dispose();
+  }
+}
