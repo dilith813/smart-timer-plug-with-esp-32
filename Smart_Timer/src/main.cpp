@@ -46,7 +46,7 @@ bool RESET_FLAG = false;
 
 // Firebase details
 #define FIREBASE_HOST "smarttimerplug-default-rtdb.firebaseio.com"
-#define FIREBASE_API_KEY "AIzaSyBv--LTAWwKUKwZeXPRXsJOiGF_22tDEIQ"
+#define FIREBASE_API_KEY ""
 
 FirebaseData fbdo;
 FirebaseAuth auth;
