@@ -3,7 +3,7 @@ A hybrid smart timer plug that users can set the time through their phone, or vi
 
 ## Introduction
 
-This was part of a project my group did for the semester 2 module EN1190 - Electronic Design Project of the Department of Electronic and Telecommunication Engineering, University of Moratuwa. 
+This was part of a project my group did for the semester 2 module EN1190 - Engineering Design Project of the Department of Electronic and Telecommunication Engineering, University of Moratuwa. 
 
 My contribution towards this project was upgrading the initial skeleton code we had for the functionality of the ESP board, and building an android app for remote control. The codes for both the ESP (which was built using PlatformIO), and the code for the android app are included in this repository.
 
